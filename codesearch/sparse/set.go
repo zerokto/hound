@@ -12,8 +12,8 @@ package sparse
 // A Set is a sparse set of uint32 values.
 // http://research.swtch.com/2008/03/using-uninitialized-memory-for-fun-and.html
 type Set struct {
-	dense  []uint32
-	sparse []uint32
+	dense  []uint32 // 稠密数组，用于存储实际的元素值
+	sparse []uint32 // 稀疏数组，用于快速查找元素在dense中的位置
 }
 
 // NewSet returns a new Set with a given maximum size.

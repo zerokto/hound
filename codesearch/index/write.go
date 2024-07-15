@@ -34,27 +34,26 @@ import (
 
 // An IndexWriter creates an on-disk index corresponding to a set of files.
 type IndexWriter struct {
-	LogSkip bool // log information about skipped files
-	Verbose bool // log status using package log
+	LogSkip bool // log information about skipped files 是否记录跳过文件的信息
+	Verbose bool // log status using package log 是否记录详细的运行状态
 
-	trigram *sparse.Set // trigrams for the current file
-	buf     [8]byte     // scratch buffer
+	trigram *sparse.Set // trigrams for the current file 稀疏集合，用于存储当前文件的三元组
+	buf     [8]byte     // scratch buffer 字节缓存区， 用于临时存储操作中的字节数据。
+	paths   []string    // 一个字符串切片，存储文件路径。
 
-	paths []string
+	nameData   *bufWriter // temp file holding list of names // 存储文件名数据的临时文件
+	nameLen    uint32     //nolint number of bytes written to nameData 存储文件名数据的长度
+	nameIndex  *bufWriter // temp file holding name index 文件名索引的临时文件
+	numName    int        // number of names written 已经写入的文件名数量
+	totalBytes int64      // 已处理的总字节数。
 
-	nameData   *bufWriter // temp file holding list of names
-	nameLen    uint32     //nolint number of bytes written to nameData
-	nameIndex  *bufWriter // temp file holding name index
-	numName    int        // number of names written
-	totalBytes int64
+	post      []postEntry // list of (trigram, file#) pairs 存储（三元组，文件编号）对
+	postFile  []*os.File  // flushed post entries 已冲洗的倒排索引文件
+	postData  [][]byte    // mmap buffers to be unmapped 内存映射的缓冲区
+	postIndex *bufWriter  // temp file holding posting list index 存储倒排索引的临时文件
 
-	post      []postEntry // list of (trigram, file#) pairs
-	postFile  []*os.File  // flushed post entries
-	postData  [][]byte    // mmap buffers to be unmapped
-	postIndex *bufWriter  // temp file holding posting list index
-
-	inbuf []byte     // input buffer
-	main  *bufWriter // main index file
+	inbuf []byte     // input buffer 输入缓冲区，用于读取文件数据
+	main  *bufWriter // main index file 主索引文件，用于最终的索引输出
 }
 
 const npost = 64 << 20 / 8 // 64 MB worth of post entries
@@ -62,7 +61,7 @@ const npost = 64 << 20 / 8 // 64 MB worth of post entries
 // Create returns a new IndexWriter that will write the index to file.
 func Create(file string) *IndexWriter {
 	return &IndexWriter{
-		trigram:   sparse.NewSet(1 << 24),
+		trigram:   sparse.NewSet(1 << 24), // 稀疏集合，可以存储2^24个元素
 		nameData:  bufCreate(""),
 		nameIndex: bufCreate(""),
 		postIndex: bufCreate(""),
@@ -76,11 +75,11 @@ func Create(file string) *IndexWriter {
 type postEntry uint64
 
 func (p postEntry) trigram() uint32 {
-	return uint32(p >> 32)
+	return uint32(p >> 32) // 高32位为三元组，低32位为文件编号
 }
 
 func (p postEntry) fileid() uint32 {
-	return uint32(p)
+	return uint32(p) // 高32位为三元组，低32位为文件编号
 }
 
 func makePostEntry(trigram, fileid uint32) postEntry {
@@ -122,8 +121,9 @@ func (ix *IndexWriter) AddFile(name string) {
 // It logs errors using package log.
 func (ix *IndexWriter) Add(name string, f io.Reader) string {
 	ix.trigram.Reset()
+
 	var (
-		c          = byte(0)  //nolint
+		c          = byte(0) //nolint
 		i          = 0
 		buf        = ix.inbuf[:0]
 		tv         = uint32(0)
@@ -131,13 +131,14 @@ func (ix *IndexWriter) Add(name string, f io.Reader) string {
 		linelen    = 0
 		numLines   = 0
 		longLines  = 0
-		skipReason = ""  //nolint
+		skipReason = "" //nolint
 	)
 
 	for {
-		tv = (tv << 8) & (1<<24 - 1)
-		if i >= len(buf) {
-			n, err := f.Read(buf[:cap(buf)])
+
+		tv = (tv << 8) & (1<<24 - 1) // 移位并掩码操作以保持 tv 为 24 位
+		if i >= len(buf) {           // 缓冲区已经用完，需要读取
+			n, err := f.Read(buf[:cap(buf)]) // 读取到 buf 的容量大小
 			if n == 0 {
 				if err != nil {
 					if err == io.EOF {
@@ -149,42 +150,46 @@ func (ix *IndexWriter) Add(name string, f io.Reader) string {
 				log.Printf("%s: 0-length read\n", name)
 				return ""
 			}
-			buf = buf[:n]
-			i = 0
+			buf = buf[:n] // 更新 buf 的长度
+			i = 0         // 重置 i
 		}
-		c = buf[i]
+
+		c = buf[i] // 获取下一个字符
 		i++
-		tv |= uint32(c)
-		if n++; n >= 3 {
+		tv |= uint32(c)  // 更新tv的后8位
+		if n++; n >= 3 { // 更新文件总字节数，当达到 3 字节时开始添加三元组
 			ix.trigram.Add(tv)
 		}
-		if !validUTF8((tv>>8)&0xFF, tv&0xFF) {
+
+		if !validUTF8((tv>>8)&0xFF, tv&0xFF) { // 检查当前三元组是否为有效的 UTF-8 序列
 			skipReason = "Invalid UTF-8"
 			if ix.LogSkip {
 				log.Printf("%s: %s\n", name, skipReason)
 			}
 			return skipReason
 		}
-		if n > maxFileLen {
+
+		if n > maxFileLen { // 查文件是否超过最大允许长度
 			skipReason = "Too long"
 			if ix.LogSkip {
 				log.Printf("%s: %s\n", name, skipReason)
 			}
 			return skipReason
 		}
-		linelen++
+
+		linelen++ //  增加当前行长度
 		if c == '\n' {
 			numLines++
 			if linelen > maxLineLen {
-				longLines++
+				longLines++ // 增加长行数
 			}
 			linelen = 0
 		}
 	}
 
-	if n > 0 {
-		trigramRatio := float32(ix.trigram.Len()) / float32(n)
-		if trigramRatio > maxTrigramRatio && ix.trigram.Len() > maxTextTrigrams {
+	if n > 0 { // 如果文件中有数据
+		trigramRatio := float32(ix.trigram.Len()) / float32(n)                    // 计算三元组比率
+		if trigramRatio > maxTrigramRatio && ix.trigram.Len() > maxTextTrigrams { // 检查比率是否过高
 			skipReason = fmt.Sprintf("Trigram ratio too high (%0.2f), probably not text", trigramRatio)
 			if ix.LogSkip {
 				log.Printf("%s: %s\n", name, skipReason)
@@ -192,7 +197,7 @@ func (ix *IndexWriter) Add(name string, f io.Reader) string {
 			return skipReason
 		}
 
-		longLineRatio := float32(longLines) / float32(numLines)
+		longLineRatio := float32(longLines) / float32(numLines) // 计算长行比率
 		if longLineRatio > maxLongLineRatio {
 			skipReason = fmt.Sprintf("Too many long lines, ratio: %0.2f", longLineRatio)
 			if ix.LogSkip {
@@ -202,18 +207,18 @@ func (ix *IndexWriter) Add(name string, f io.Reader) string {
 		}
 	}
 
-	ix.totalBytes += n
+	ix.totalBytes += n // 更新文件总字节数
 
 	if ix.Verbose {
 		log.Printf("%d %d %s\n", n, ix.trigram.Len(), name)
 	}
 
-	fileid := ix.addName(name)
-	for _, trigram := range ix.trigram.Dense() {
-		if len(ix.post) >= cap(ix.post) {
-			ix.flushPost()
+	fileid := ix.addName(name)                   // 添加文件名到索引，并获取文件 ID
+	for _, trigram := range ix.trigram.Dense() { // 遍历所有三元组
+		if len(ix.post) >= cap(ix.post) { // 检查倒排索引是否已满
+			ix.flushPost() // 如果已满，刷新倒排索引
 		}
-		ix.post = append(ix.post, makePostEntry(trigram, fileid))
+		ix.post = append(ix.post, makePostEntry(trigram, fileid)) // 将三元组和文件 ID 添加到倒排索引
 	}
 
 	return ""
@@ -223,30 +228,37 @@ func (ix *IndexWriter) Add(name string, f io.Reader) string {
 func (ix *IndexWriter) Flush() {
 	ix.addName("")
 
+	// 保存关键部分的文件偏移量
 	var off [5]uint32
 	ix.main.writeString(magic)
 	off[0] = ix.main.offset()
+
 	for _, p := range ix.paths {
 		ix.main.writeString(p)
 		ix.main.writeString("\x00")
 	}
 	ix.main.writeString("\x00")
 	off[1] = ix.main.offset()
+
 	copyFile(ix.main, ix.nameData)
 	off[2] = ix.main.offset()
+
 	ix.mergePost(ix.main)
 	off[3] = ix.main.offset()
+
 	copyFile(ix.main, ix.nameIndex)
 	off[4] = ix.main.offset()
+
 	copyFile(ix.main, ix.postIndex)
 	for _, v := range off {
 		ix.main.writeUint32(v)
 	}
 	ix.main.writeString(trailerMagic)
 
+	// 清理工作
 	os.Remove(ix.nameData.name)
 	for _, d := range ix.postData {
-		unmmap(d)  //nolint
+		unmmap(d) //nolint
 	}
 	for _, f := range ix.postFile {
 		f.Close()
@@ -275,14 +287,14 @@ func copyFile(dst, src *bufWriter) {
 // addName adds the file with the given name to the index.
 // It returns the assigned file ID number.
 func (ix *IndexWriter) addName(name string) uint32 {
-	if strings.Contains(name, "\x00") {
+	if strings.Contains(name, "\x00") { // 文件名不能包含 NUL 字节
 		log.Fatalf("%q: file has NUL byte in name", name)
 	}
 
-	ix.nameIndex.writeUint32(ix.nameData.offset())
-	ix.nameData.writeString(name)
-	ix.nameData.writeByte(0)
-	id := ix.numName
+	ix.nameIndex.writeUint32(ix.nameData.offset()) // 写入文件名偏移量到索引
+	ix.nameData.writeString(name)                  // 写入文件名到数据
+	ix.nameData.writeByte(0)                       // 写入 NUL 字节
+	id := ix.numName                               // 获取文件 ID, 已经添加过的文件 个数
 	ix.numName++
 	return uint32(id)
 }
@@ -310,7 +322,7 @@ func (ix *IndexWriter) flushPost() {
 	}
 
 	ix.post = ix.post[:0]
-	w.Seek(0, 0)  //nolint
+	w.Seek(0, 0) //nolint
 	ix.postFile = append(ix.postFile, w)
 }
 
@@ -364,19 +376,19 @@ func (ix *IndexWriter) mergePost(out *bufWriter) {
 // A postChunk represents a chunk of post entries flushed to disk or
 // still in memory.
 type postChunk struct {
-	e postEntry   // next entry
-	m []postEntry // remaining entries after e
+	e postEntry   // next entry 下一个
+	m []postEntry // remaining entries after e 之后所有的
 }
 
-const postBuf = 4096  //nolint
+const postBuf = 4096 //nolint
 
-// A postHeap is a heap (priority queue) of postChunks.
+// A postHeap is a heap (priority queue) of postChunks. 用来管理倒排索引的堆数据结构， tirgram 排序， 每个 triram 对应一个 postChunk，小根堆
 type postHeap struct {
-	ch []*postChunk
+	ch []*postChunk // 管理Chunk的集合
 }
 
 func (h *postHeap) addFile(f *os.File) []byte {
-	data := mmapFile(f).d
+	data := mmapFile(f).d // 使用mmapFile函数将文件映射到内存中
 	m := (*[npost]postEntry)(unsafe.Pointer(&data[0]))[:len(data)/8]
 	h.addMem(m)
 	return data
@@ -388,16 +400,18 @@ func (h *postHeap) addMem(x []postEntry) {
 
 // step reads the next entry from ch and saves it in ch.e.
 // It returns false if ch is over.
-func (h *postHeap) step(ch *postChunk) bool {  //nolint
+func (h *postHeap) step(ch *postChunk) bool { //nolint
 	old := ch.e
 	m := ch.m
 	if len(m) == 0 {
 		return false
 	}
+	// 读取下一个
 	ch.e = postEntry(m[0])
+	// 更新m
 	m = m[1:]
 	ch.m = m
-	if old >= ch.e {
+	if old >= ch.e { // 违反排序规则
 		panic("bad sort")
 	}
 	return true
@@ -406,6 +420,7 @@ func (h *postHeap) step(ch *postChunk) bool {  //nolint
 // add adds the chunk to the postHeap.
 // All adds must be called before the first call to next.
 func (h *postHeap) add(ch *postChunk) {
+	// 将第一个条目放到堆中
 	if len(ch.m) > 0 {
 		ch.e = ch.m[0]
 		ch.m = ch.m[1:]
@@ -414,7 +429,7 @@ func (h *postHeap) add(ch *postChunk) {
 }
 
 // empty reports whether the postHeap is empty.
-func (h *postHeap) empty() bool {  //nolint
+func (h *postHeap) empty() bool { //nolint
 	return len(h.ch) == 0
 }
 
@@ -489,10 +504,10 @@ func (h *postHeap) siftUp(j int) {
 
 // A bufWriter is a convenience wrapper: a closeable bufio.Writer.
 type bufWriter struct {
-	name string
-	file *os.File
-	buf  []byte
-	tmp  [8]byte  //nolint
+	name string   // 文件名称
+	file *os.File // 指向底层的os.File的指针，用于实际的文件IO操作
+	buf  []byte   // 一个字节切片
+	tmp  [8]byte  //nolint 一个临时字节数组，可能用于内部操作，例如格式化数字等
 }
 
 // bufCreate creates a new file with the given name and returns a
@@ -503,14 +518,17 @@ func bufCreate(name string) *bufWriter {
 		f   *os.File
 		err error
 	)
+
 	if name != "" {
 		f, err = os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
 	} else {
 		f, err = ioutil.TempFile("", "csearch")
 	}
+
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	return &bufWriter{
 		name: f.Name(),
 		buf:  make([]byte, 0, 256<<10),
@@ -519,16 +537,17 @@ func bufCreate(name string) *bufWriter {
 }
 
 func (b *bufWriter) write(x []byte) {
-	n := cap(b.buf) - len(b.buf)
+	n := cap(b.buf) - len(b.buf) // 计算当前bufWriter的可用空间
 	if len(x) > n {
-		b.flush()
-		if len(x) >= cap(b.buf) {
-			if _, err := b.file.Write(x); err != nil {
+		b.flush()                 // 刷新当前bufWriter
+		if len(x) >= cap(b.buf) { // 判断x是否大于bufWriter的容量
+			if _, err := b.file.Write(x); err != nil { // 直接写入文件
 				log.Fatalf("writing %s: %v", b.name, err)
 			}
 			return
 		}
 	}
+
 	b.buf = append(b.buf, x...)
 }
 
@@ -555,11 +574,12 @@ func (b *bufWriter) writeString(s string) {
 
 // offset returns the current write offset.
 func (b *bufWriter) offset() uint32 {
-	off, _ := b.file.Seek(0, 1)
-	off += int64(len(b.buf))
-	if int64(uint32(off)) != off {
+	off, _ := b.file.Seek(0, 1)    // 获取当前文件指针的位置
+	off += int64(len(b.buf))       // 计算当前bufWriter的偏移
+	if int64(uint32(off)) != off { // 判断是否发生溢出，如果发生溢出，贼超过4GB
 		log.Fatalf("index is larger than 4GB")
 	}
+
 	return uint32(off)
 }
 
@@ -578,7 +598,7 @@ func (b *bufWriter) flush() {
 func (b *bufWriter) finish() *os.File {
 	b.flush()
 	f := b.file
-	f.Seek(0, 0)  //nolint
+	f.Seek(0, 0) //nolint 将读写指针移动到开始位置
 	return f
 }
 
@@ -596,6 +616,7 @@ func (b *bufWriter) writeUint32(x uint32) {
 	b.buf = append(b.buf, byte(x>>24), byte(x>>16), byte(x>>8), byte(x))
 }
 
+// 功能是将一个 32 位无符号整数 (uint32) 编码为可变长度整数 (Varint) 并写入缓冲区。Varints 是一种用于编码整数的序列化技术，特别适用于那些小整数占多数的场景，因为它可以节省存储空间。
 func (b *bufWriter) writeUvarint(x uint32) {
 	if cap(b.buf)-len(b.buf) < 5 {
 		b.flush()
